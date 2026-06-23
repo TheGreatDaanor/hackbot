@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from hackbot.config import LOGS_DIR, resolve_tool_path
+from hackbot.config import INSTALL_DRIVERS, LOGS_DIR, resolve_tool_path
 
 # Lazy reference — filled at runtime to avoid circular imports
 _plugin_manager = None
@@ -107,6 +107,11 @@ RISKY_PATTERNS = [
     "netcat -e",
     "bash -i",
 ]
+
+# Standalone shell-operator tokens that indicate command chaining or redirection.
+# Detected as discrete tokens (via shlex), so characters inside a single argument
+# (e.g. an '&' in a URL query string) are never flagged.
+SHELL_OPERATOR_TOKENS = frozenset({";", "|", "||", "&", "&&", ">", ">>", "<", "<<"})
 
 
 class ToolRunner:
@@ -313,7 +318,56 @@ class ToolRunner:
 
         return candidate
 
-    def validate_command(self, command: str) -> tuple[bool, str]:
+    @staticmethod
+    def _strip_wrapping_quotes(value: str) -> str:
+        """Remove one layer of matching shell quotes from a token."""
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            return value[1:-1]
+        return value
+
+    @staticmethod
+    def _split_command(command: str) -> List[str]:
+        """Split command text for validation without invoking a shell."""
+        if platform.system() == "Windows":
+            return [
+                ToolRunner._strip_wrapping_quotes(part)
+                for part in shlex.split(command, posix=False)
+            ]
+        return shlex.split(command)
+
+    @staticmethod
+    def _contains_shell_operators(command: str) -> Optional[str]:
+        """Return the offending marker if *command* contains shell command
+        substitution or a standalone shell-operator token, else None.
+
+        Operates on the NORMALIZED command (wrapping backticks and a leading
+        ``$ `` prompt have already been stripped by ``_normalize_command``), so
+        only *embedded* substitution survives to be rejected here.  Detection is
+        token-based to avoid false positives on legitimate arguments such as URL
+        query strings (``http://x/?a=1&b=2`` stays inside a single shlex token).
+
+        Returns ``"<unparseable>"`` when the command cannot be tokenized
+        (e.g. unbalanced quotes) so the caller can reject it gracefully.
+        """
+        # Command substitution: any remaining backtick or "$(" is rejected.
+        if "`" in command:
+            return "`"
+        if "$(" in command:
+            return "$("
+
+        try:
+            tokens = ToolRunner._split_command(command)
+        except ValueError:
+            return "<unparseable>"
+
+        for tok in tokens:
+            if tok in SHELL_OPERATOR_TOKENS:
+                return tok
+        return None
+
+    def validate_command(
+        self, command: str, allow_install_drivers: bool = False,
+    ) -> tuple[bool, str]:
         """
         Validate a command for safety.
         Returns (is_safe, reason).
@@ -330,8 +384,21 @@ class ToolRunner:
             if blocked in cmd_lower:
                 return False, f"Blocked command detected: {blocked}"
 
+        # Reject shell command-substitution and standalone operator tokens.
+        # Unconditional (not safe_mode-gated): execution is shell-free, so this
+        # is a clear, early hard-reject of unsupported syntax rather than a
+        # confirmable RISKY warning.
+        offender = self._contains_shell_operators(command)
+        if offender == "<unparseable>":
+            return False, "Invalid command: unbalanced quotes"
+        if offender is not None:
+            return False, f"Shell metacharacter not allowed: '{offender}'"
+
         # Extract tool name (skip 'sudo' prefix for validation)
-        parts = shlex.split(command) if platform.system() != "Windows" else command.split()
+        try:
+            parts = self._split_command(command)
+        except ValueError:
+            return False, "Invalid command: unbalanced quotes"
         if not parts:
             return False, "Empty command"
 
@@ -341,7 +408,9 @@ class ToolRunner:
 
         # Check if tool is allowed
         if not self.is_tool_allowed(tool):
-            return False, f"Tool '{tool}' is not in the allowed list"
+            driver_ok = allow_install_drivers and os.path.basename(tool).lower() in INSTALL_DRIVERS
+            if not driver_ok:
+                return False, f"Tool '{tool}' is not in the allowed list"
 
         # Check risky patterns in safe mode
         if self.safe_mode:
@@ -381,11 +450,14 @@ class ToolRunner:
         Returns (ok, message).  Sets ``_sudo_validated`` on success so the
         check is only performed once per runner lifetime.
         """
-        if not self.sudo_mode or platform.system() == "Windows":
+        if not self.sudo_mode:
             return True, "sudo not required"
 
         if self._sudo_validated:
             return True, "sudo already validated"
+
+        if platform.system() == "Windows":
+            return True, "sudo not required"
 
         try:
             if self.sudo_password:
@@ -423,7 +495,10 @@ class ToolRunner:
         except Exception as e:
             return False, f"sudo check error: {e}"
 
-    def execute(self, command: str, tool_name: str = "", explanation: str = "") -> ToolResult:
+    def execute(
+        self, command: str, tool_name: str = "", explanation: str = "",
+        allow_install_drivers: bool = False,
+    ) -> ToolResult:
         """
         Execute a command synchronously with timeout and output capture.
         """
@@ -437,7 +512,9 @@ class ToolRunner:
         command = self._apply_sudo(command)
 
         # Validate
-        is_safe, reason = self.validate_command(command)
+        is_safe, reason = self.validate_command(
+            command, allow_install_drivers=allow_install_drivers,
+        )
 
         if not is_safe:
             return ToolResult(
@@ -472,11 +549,13 @@ class ToolRunner:
         try:
             is_windows = platform.system() == "Windows"
             proc = subprocess.Popen(
+                # Windows: pass the raw string to CreateProcess (no cmd.exe, so
+                # shell metacharacters are NOT interpreted). POSIX: split to argv.
                 command if is_windows else shlex.split(command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE if stdin_data else None,
-                shell=is_windows,
+                shell=False,
                 text=True,
                 env=self._get_env(),
             )
@@ -491,10 +570,7 @@ class ToolRunner:
             duration = time.time() - start
 
             # Truncate if needed
-            truncated = False
-            if len(stdout) > self.MAX_OUTPUT_SIZE:
-                stdout = stdout[: self.MAX_OUTPUT_SIZE] + f"\n\n[OUTPUT TRUNCATED at {self.MAX_OUTPUT_SIZE} bytes]"
-                truncated = True
+            stdout, truncated = self._truncate_output(stdout)
 
             result = ToolResult(
                 tool=self._infer_tool_name(command, tool_name),
@@ -540,12 +616,17 @@ class ToolRunner:
         return result
 
     async def execute_async(self, command: str, tool_name: str = "") -> ToolResult:
-        """Execute a command asynchronously."""
+        """Execute a command asynchronously (shell-free; parity with execute())."""
         command = self._normalize_command(command)
+
+        # Plugin execution — intercept hackbot-plugin commands
+        if command.strip().startswith("hackbot-plugin "):
+            return self._execute_plugin(command, tool_name)
 
         # Apply sudo prefix if enabled
         command = self._apply_sudo(command)
 
+        # Validate
         is_safe, reason = self.validate_command(command)
         if not is_safe:
             return ToolResult(
@@ -558,11 +639,46 @@ class ToolRunner:
                 success=False,
             )
 
+        # Check for risky commands
+        if "RISKY" in reason and not self.auto_confirm:
+            if self.on_confirm:
+                confirmed = self.on_confirm(command, reason)
+                if not confirmed:
+                    return ToolResult(
+                        tool=self._infer_tool_name(command, tool_name),
+                        command=command,
+                        stdout="",
+                        stderr="User declined execution",
+                        return_code=-2,
+                        duration=0,
+                        success=False,
+                    )
+
         start = time.time()
         stdin_data = self._feed_sudo_password() if "sudo -S" in command else None
+
+        # Tokenize without a shell so /bin/sh is never invoked (parity with execute()).
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            args = shlex.split(command)
+        except ValueError as e:
+            result = ToolResult(
+                tool=self._infer_tool_name(command, tool_name),
+                command=command,
+                stdout="",
+                stderr=f"Execution error: {e}",
+                return_code=-4,
+                duration=time.time() - start,
+                success=False,
+            )
+            self.history.append(result)
+            self._log_execution(result)
+            if self.on_output:
+                self.on_output(result.output)
+            return result
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE if stdin_data else None,
@@ -582,6 +698,9 @@ class ToolRunner:
 
             duration = time.time() - start
 
+            # Truncate if needed
+            stdout, truncated = self._truncate_output(stdout)
+
             result = ToolResult(
                 tool=self._infer_tool_name(command, tool_name),
                 command=command,
@@ -590,6 +709,18 @@ class ToolRunner:
                 return_code=proc.returncode or 0,
                 duration=duration,
                 success=(proc.returncode or 0) == 0,
+                truncated=truncated,
+            )
+        except FileNotFoundError:
+            duration = time.time() - start
+            result = ToolResult(
+                tool=self._infer_tool_name(command, tool_name),
+                command=command,
+                stdout="",
+                stderr=f"Tool not found: {self._infer_tool_name(command, tool_name)}",
+                return_code=-3,
+                duration=duration,
+                success=False,
             )
         except Exception as e:
             duration = time.time() - start
@@ -604,7 +735,17 @@ class ToolRunner:
             )
 
         self.history.append(result)
+        self._log_execution(result)
+        if self.on_output:
+            self.on_output(result.output)
         return result
+
+    def _truncate_output(self, stdout: str) -> tuple[str, bool]:
+        """Cap *stdout* at MAX_OUTPUT_SIZE. Returns (text, truncated)."""
+        if len(stdout) <= self.MAX_OUTPUT_SIZE:
+            return stdout, False
+        notice = f"\n\n[OUTPUT TRUNCATED at {self.MAX_OUTPUT_SIZE} bytes]"
+        return stdout[: self.MAX_OUTPUT_SIZE] + notice, True
 
     def _get_env(self) -> Dict[str, str]:
         """Get sanitized environment for subprocess execution."""

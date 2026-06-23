@@ -74,6 +74,12 @@ from hackbot.ui import (
 load_dotenv()
 
 
+PROVIDER_ALIASES = {
+    "deep": "deepseek",
+    "deepseek": "deepseek",
+}
+
+
 def _should_block_root_gui_launch() -> bool:
     """Return True if GUI launch should be blocked due to root/sudo context.
 
@@ -134,6 +140,14 @@ class HackBotApp:
         elif step.action == "report":
             print_success(step.description)
 
+    def _rebuild_ai_engine(self) -> None:
+        self.engine = AIEngine(self.config.ai)
+        self.chat.engine = self.engine
+        self.plan.engine = self.engine
+        if self.agent:
+            self.agent.engine = self.engine
+            self.agent.summarizer.engine = self.engine
+
     def _on_confirm(self, command: str, reason: str) -> bool:
         """Handle confirmation for risky commands."""
         return confirm_action(command, reason)
@@ -177,6 +191,7 @@ class HackBotApp:
             "/plan": lambda: self._switch_mode("plan"),
             "/config": lambda: self._show_config(),
             "/tools": lambda: self._show_tools(),
+            "/install": lambda: self._install_tool(args),
             "/model": lambda: self._set_model(args),
             "/key": lambda: self._set_key(args),
             "/provider": lambda: self._set_provider(args),
@@ -399,6 +414,23 @@ class HackBotApp:
         show_tools_status(tools)
         return True
 
+    def _install_tool(self, args: str) -> bool:
+        tool = args.strip()
+        if not tool:
+            print_error("Usage: /install <tool>")
+            return True
+        if self.mode != "agent" or not self.agent:
+            self.agent = AgentMode(
+                engine=self.engine,
+                config=self.config,
+                on_step=self._on_agent_step,
+                on_confirm=self._on_confirm,
+                on_output=self._on_tool_output,
+            )
+        result = self.agent._process_install_action({"action": "install", "tool": tool})
+        console.print(Markdown(result))
+        return True
+
     def _set_model(self, model: str) -> bool:
         if not model:
             print_error("Usage: /model <model-name>\n  See available models: /models")
@@ -492,15 +524,35 @@ class HackBotApp:
 
     def _set_key(self, key: str) -> bool:
         if not key:
-            print_error("Usage: /key <api-key>")
+            print_error("Usage: /key <api-key>  or  /key deepseek <api-key>")
             return True
+
+        key_parts = key.split(maxsplit=1)
+        requested_provider = PROVIDER_ALIASES.get(key_parts[0].lower())
+        if requested_provider:
+            if len(key_parts) == 1:
+                print_error(f"Usage: /key {key_parts[0]} <api-key>")
+                print_info(f"Or run: /provider {requested_provider}  then  /key <api-key>")
+                return True
+
+            preset = PROVIDERS[requested_provider]
+            self.config.ai.provider = requested_provider
+            if preset["models"]:
+                self.config.ai.model = preset["models"][0]["id"]
+            self.config.ai.base_url = ""
+            key = key_parts[1].strip()
+            if not key:
+                print_error(f"Usage: /key {key_parts[0]} <api-key>")
+                return True
+            print_info(f"Provider: {preset['name']}")
+
+        if key.lower() in PROVIDER_ALIASES:
+            print_error(f"Usage: /key {key} <api-key>")
+            print_info(f"Or run: /provider {PROVIDER_ALIASES[key.lower()]}  then  /key <api-key>")
+            return True
+
         self.config.ai.api_key = key
-        self.engine = AIEngine(self.config.ai)
-        self.chat.engine = self.engine
-        self.plan.engine = self.engine
-        if self.agent:
-            self.agent.engine = self.engine
-            self.agent.summarizer.engine = self.engine
+        self._rebuild_ai_engine()
 
         # Validate the key before saving
         print_info("Validating API key...")
@@ -730,12 +782,7 @@ class HackBotApp:
             self.config.ai.model = preset["models"][0]["id"]
         # Clear base_url so engine uses preset
         self.config.ai.base_url = ""
-        self.engine = AIEngine(self.config.ai)
-        self.chat.engine = self.engine
-        self.plan.engine = self.engine
-        if self.agent:
-            self.agent.engine = self.engine
-            self.agent.summarizer.engine = self.engine
+        self._rebuild_ai_engine()
         save_config(self.config)
         print_success(
             f"Provider: {preset['name']}\n"
@@ -2605,6 +2652,16 @@ def tools(ctx):
     config = ctx.obj["config"]
     tool_status = detect_tools(config.agent.allowed_tools)
     show_tools_status(tool_status)
+
+
+@main.command(name="install")
+@click.argument("tool")
+@click.pass_context
+def install_cmd(ctx, tool):
+    """Install a security tool that isn't present."""
+    config = ctx.obj["config"]
+    app = HackBotApp(config)
+    app._install_tool(tool)
 
 
 @main.command(name="update")
