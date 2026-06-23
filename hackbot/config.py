@@ -41,6 +41,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "provider": "openai",
         "model": "gpt-4o",
         "api_key": "",
+        "api_keys": [],
         "base_url": "",
         "temperature": 0.2,
         "max_tokens": 4096,
@@ -53,6 +54,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sudo_mode": False,
         "sudo_password": "",
         "nvd_api_key": "",
+        "allow_arbitrary_install": False,
         "allowed_tools": [
             "nmap",
             "masscan",
@@ -165,6 +167,7 @@ class AIConfig:
     provider: str = "openai"
     model: str = "gpt-4o"
     api_key: str = ""
+    api_keys: List[str] = field(default_factory=list)
     base_url: str = ""
     temperature: float = 0.2
     max_tokens: int = 4096
@@ -179,7 +182,10 @@ class AgentConfig:
     sudo_mode: bool = False
     sudo_password: str = ""
     nvd_api_key: str = ""
-    allowed_tools: List[str] = field(default_factory=lambda: DEFAULT_CONFIG["agent"]["allowed_tools"])
+    allow_arbitrary_install: bool = False
+    allowed_tools: List[str] = field(
+        default_factory=lambda: DEFAULT_CONFIG["agent"]["allowed_tools"]
+    )
 
 
 @dataclass
@@ -220,6 +226,62 @@ class HackBotConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
+
+
+def reconcile_keys(ai: Dict[str, Any]) -> None:
+    """Normalize the API key pool in an ``ai`` config dict, in place.
+
+    Dedupes, drops empties, and keeps the active key first so the invariant
+    ``api_key == api_keys[0]`` always holds. Seeds the pool from a legacy
+    single ``api_key`` and lets an env-provided ``api_key`` take priority by
+    placing it first.
+    """
+    pool = [k for k in dict.fromkeys([ai.get("api_key", "")] + list(ai.get("api_keys") or [])) if k]
+    ai["api_keys"] = pool
+    ai["api_key"] = pool[0] if pool else ""
+
+
+def add_key(cfg: "AIConfig", key: str) -> None:
+    """Append *key* to the pool if not already present; keep ``api_key`` valid."""
+    key = key.strip()
+    if not key or key in cfg.api_keys:
+        return
+    cfg.api_keys.append(key)
+    if not cfg.api_key:
+        cfg.api_key = cfg.api_keys[0]
+
+
+def remove_key(cfg: "AIConfig", index: int) -> str:
+    """Remove and return the pool entry at *index*. Raises IndexError if invalid.
+
+    If the removed key was the active one, the new active key becomes the new
+    ``api_keys[0]`` (or empty when the pool is exhausted).
+    """
+    if index < 0 or index >= len(cfg.api_keys):
+        raise IndexError("API key index out of range")
+    removed = cfg.api_keys.pop(index)
+    cfg.api_key = cfg.api_keys[0] if cfg.api_keys else ""
+    return removed
+
+
+def set_active_key(cfg: "AIConfig", key: str) -> None:
+    """Make *key* the active key by moving/inserting it at the front of the pool."""
+    key = key.strip()
+    if not key:
+        return
+    if key in cfg.api_keys:
+        cfg.api_keys.remove(key)
+    cfg.api_keys.insert(0, key)
+    cfg.api_key = key
+
+
+def mask_key(key: str) -> str:
+    """Return a display-safe masked form of an API key."""
+    if not key:
+        return "(empty)"
+    if len(key) <= 8:
+        return key[:3] + "…"
+    return f"{key[:5]}…{key[-4:]}"
 
 
 def load_config() -> HackBotConfig:
@@ -305,6 +367,8 @@ def load_config() -> HackBotConfig:
         DEFAULT_CONFIG["agent"]["allowed_tools"],
     )
 
+    reconcile_keys(merged.setdefault("ai", {}))
+
     cfg = HackBotConfig(
         ai=AIConfig(**merged.get("ai", {})),
         agent=AgentConfig(**merged.get("agent", {})),
@@ -324,6 +388,7 @@ def save_config(cfg: HackBotConfig) -> None:
             "provider": cfg.ai.provider,
             "model": cfg.ai.model,
             "api_key": cfg.ai.api_key,
+            "api_keys": cfg.ai.api_keys,
             "base_url": cfg.ai.base_url,
             "temperature": cfg.ai.temperature,
             "max_tokens": cfg.ai.max_tokens,
@@ -336,6 +401,7 @@ def save_config(cfg: HackBotConfig) -> None:
             "sudo_mode": cfg.agent.sudo_mode,
             "sudo_password": cfg.agent.sudo_password,
             "nvd_api_key": cfg.agent.nvd_api_key,
+            "allow_arbitrary_install": cfg.agent.allow_arbitrary_install,
             "allowed_tools": cfg.agent.allowed_tools,
         },
         "reporting": {
@@ -404,6 +470,7 @@ def _merge_allowed_tools(current: List[str], defaults: List[str]) -> List[str]:
 
 # ── tool detection ───────────────────────────────────────────────────────────
 
+
 def detect_platform() -> Dict[str, str]:
     """Return platform information."""
     return {
@@ -443,6 +510,71 @@ TOOL_ALIASES: Dict[str, List[str]] = {
         "redir6",
         "smurf6",
     ],
+}
+
+# Package-manager binaries the ToolInstaller is permitted to invoke. These are
+# deliberately NOT in agent.allowed_tools so the agent cannot run them via a
+# normal `execute` action — only ToolInstaller.install() may, via the runner's
+# allow_install_drivers bypass.
+INSTALL_DRIVERS: List[str] = ["apt-get", "dnf", "pacman", "brew", "pipx", "pip", "go"]
+
+# Curated tool -> package recipes for autonomous installation.
+# `order` lists preferred managers; ToolInstaller picks the first one available
+# on the host. Per-manager values are the package/module identifier for that
+# manager. Only tools also present in agent.allowed_tools are installable.
+TOOL_INSTALL_MAP: Dict[str, Dict[str, object]] = {
+    "nuclei": {
+        "order": ["go", "apt"],
+        "go": "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+        "apt": "nuclei",
+    },
+    "subfinder": {
+        "order": ["go"],
+        "go": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+    },
+    "httpx": {
+        "order": ["go"],
+        "go": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
+    },
+    "ffuf": {
+        "order": ["go", "apt"],
+        "go": "github.com/ffuf/ffuf/v2@latest",
+        "apt": "ffuf",
+    },
+    "gobuster": {
+        "order": ["go", "apt"],
+        "go": "github.com/OJ/gobuster/v3@latest",
+        "apt": "gobuster",
+    },
+    "katana": {
+        "order": ["go"],
+        "go": "github.com/projectdiscovery/katana/cmd/katana@latest",
+    },
+    "sqlmap": {"order": ["apt", "pipx"], "apt": "sqlmap", "pipx": "sqlmap"},
+    "nikto": {"order": ["apt"], "apt": "nikto"},
+    "nmap": {
+        "order": ["apt", "dnf", "pacman", "brew"],
+        "apt": "nmap",
+        "dnf": "nmap",
+        "pacman": "nmap",
+        "brew": "nmap",
+    },
+    "whatweb": {"order": ["apt"], "apt": "whatweb"},
+    "wpscan": {"order": ["apt"], "apt": "wpscan"},
+    "hydra": {"order": ["apt"], "apt": "hydra"},
+    "dnsrecon": {"order": ["apt", "pipx"], "apt": "dnsrecon", "pipx": "dnsrecon"},
+    "amass": {
+        "order": ["apt", "go"],
+        "apt": "amass",
+        "go": "github.com/owasp-amass/amass/v4/...@master",
+    },
+    "feroxbuster": {"order": ["apt"], "apt": "feroxbuster"},
+    "masscan": {
+        "order": ["apt", "dnf", "pacman"],
+        "apt": "masscan",
+        "dnf": "masscan",
+        "pacman": "masscan",
+    },
 }
 
 
