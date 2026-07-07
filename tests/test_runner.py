@@ -315,10 +315,24 @@ def test_validate_rejects_semicolon_operator(runner):
 
 
 def test_validate_rejects_pipe_operator(runner):
-    """A pipe operator token is rejected."""
+    """A pipe operator command is validated stage-by-stage."""
+    # When a tool in the pipeline is not allowed, it's rejected
     is_safe, reason = runner.validate_command("nmap 127.0.0.1 | grep open")
     assert not is_safe
-    assert "|" in reason
+    assert "grep" in reason.lower()
+
+    # When all tools in the pipeline are allowed, it's accepted
+    is_safe2, reason2 = runner.validate_command("echo hello | cat")
+    assert is_safe2
+    assert reason2 == "OK"
+
+
+def test_execute_pipeline(runner):
+    """Test executing a pipeline with two allowed commands."""
+    if platform.system() != "Windows":
+        result = runner.execute("echo 'piped_test_data' | cat", tool_name="echo")
+        assert result.success
+        assert "piped_test_data" in result.stdout
 
 
 def test_validate_rejects_and_operator(runner):
@@ -416,3 +430,47 @@ def test_install_driver_flag_does_not_allow_arbitrary_tool():
     r = ToolRunner(allowed_tools=["nmap"])
     ok, reason = r.validate_command("evilbinary --pwn", allow_install_drivers=True)
     assert ok is False
+
+
+def test_normalize_command_strips_slash_commands(runner):
+    """Test that trailing interactive slash commands are stripped from the command line."""
+    cmd = runner._normalize_command("sudo -S nmap -sV -sC -T4 111.90.156.228 /cve")
+    # sudo prefix is stripped by _strip_sudo_prefix in _normalize_command
+    assert cmd == "nmap -sV -sC -T4 111.90.156.228"
+
+    cmd2 = runner._normalize_command("nmap 127.0.0.1 /osint")
+    assert cmd2 == "nmap 127.0.0.1"
+
+    # Should not strip if it is not a trailing slash command
+    cmd3 = runner._normalize_command("nmap 127.0.0.1 /notacommand")
+    assert cmd3 == "nmap 127.0.0.1 /notacommand"
+
+
+def test_normalize_command_fixes_dirb(runner):
+    """Test that invalid dirb command syntax is auto-corrected."""
+    cmd = runner._normalize_command("sudo -S dirb -a http://111.90.156.228")
+    assert cmd == "dirb http://111.90.156.228"
+
+    cmd2 = runner._normalize_command("dirb -a https://example.com")
+    assert cmd2 == "dirb https://example.com"
+
+
+def test_normalize_command_fixes_amass(runner):
+    """Test that invalid amass command syntax is auto-corrected."""
+    # Case A: Invalid flags / missing subcommands on IP target
+    cmd1 = runner._normalize_command("sudo -S amass -a http://111.90.156.228")
+    assert cmd1 == "amass intel -addr 111.90.156.228"
+
+    # Case A: Invalid flags / missing subcommands on domain target
+    cmd2 = runner._normalize_command("amass -a https://example.com/path")
+    assert cmd2 == "amass enum -d example.com"
+
+    # Case B: Correct subcommand but URL target
+    cmd3 = runner._normalize_command("amass intel -addr http://111.90.156.228")
+    assert cmd3 == "amass intel -addr 111.90.156.228"
+
+    cmd4 = runner._normalize_command("amass enum -d https://example.com")
+    assert cmd4 == "amass enum -d example.com"
+
+
+

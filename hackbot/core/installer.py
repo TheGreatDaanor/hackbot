@@ -100,6 +100,17 @@ class ToolInstaller:
         return None
 
     def install(self, plan: InstallPlan) -> InstallResult:
+        # Execute pre_install commands if defined in the recipe
+        recipe = self.install_map.get(plan.tool.lower(), {})
+        pre_install = recipe.get("pre_install", [])
+        for pre_cmd in pre_install:
+            self.runner.execute(
+                pre_cmd,
+                tool_name="pre-install",
+                explanation=f"Pre-install step for {plan.tool}",
+                allow_install_drivers=True,
+            )
+
         command_str = " ".join(plan.command)
         result = self.runner.execute(
             command_str,
@@ -124,3 +135,25 @@ class ToolInstaller:
             stdout=(result.stdout or "")[:2000],
             stderr=(result.stderr or "")[:2000],
         )
+
+    @staticmethod
+    def check_and_fix_wfuzz() -> str:
+        """Check if wfuzz's pkg_resources dependency is satisfied and fix it.
+
+        Returns a status message. Safe to call even if wfuzz is not installed.
+        """
+        try:
+            import importlib
+            importlib.import_module("pkg_resources")
+            return "pkg_resources is available"
+        except ImportError:
+            import subprocess as sp
+            try:
+                sp.check_call(
+                    [shutil.which("pip") or "pip", "install", "setuptools"],
+                    stdout=sp.DEVNULL,
+                    stderr=sp.DEVNULL,
+                )
+                return "Installed setuptools to fix pkg_resources for wfuzz"
+            except Exception as e:
+                return f"Failed to auto-fix pkg_resources: {e}"

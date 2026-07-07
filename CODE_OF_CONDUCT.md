@@ -151,4 +151,4 @@ The Cybersecurity Ethics section is original to HackBot and reflects the unique 
 
 ---
 
-*Last updated: April 2026 — HackBot v1.2.3*
+*Last updated: April 2026 — HackBot v1.2.4*

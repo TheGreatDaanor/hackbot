@@ -260,4 +260,4 @@ By using HackBot, you agree to:
 
 ---
 
-*Last updated: April 2026 — HackBot v1.2.3*
+*Last updated: April 2026 — HackBot v1.2.4*

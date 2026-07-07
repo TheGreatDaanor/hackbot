@@ -47,7 +47,7 @@ RUN go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/nu
     && go install github.com/tomnomnom/waybackurls@latest 2>/dev/null || true
 
 # ── Python tools ─────────────────────────────────────────────────────────────
-RUN pip install --no-cache-dir sqlmap wfuzz
+RUN pip install --no-cache-dir setuptools sqlmap wfuzz
 
 # ── HackBot Installation ────────────────────────────────────────────────────
 WORKDIR /app

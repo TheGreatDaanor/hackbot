@@ -111,7 +111,12 @@ RISKY_PATTERNS = [
 # Standalone shell-operator tokens that indicate command chaining or redirection.
 # Detected as discrete tokens (via shlex), so characters inside a single argument
 # (e.g. an '&' in a URL query string) are never flagged.
-SHELL_OPERATOR_TOKENS = frozenset({";", "|", "||", "&", "&&", ">", ">>", "<", "<<"})
+#
+# Pipes ("|") are allowed when BOTH sides are validated tools — they are executed
+# as a safe subprocess pipeline without invoking a shell.
+PIPE_TOKENS = frozenset({"|"})
+DANGEROUS_OPERATOR_TOKENS = frozenset({";", "||", "&", "&&", ">", ">>", "<", "<<"})
+SHELL_OPERATOR_TOKENS = PIPE_TOKENS | DANGEROUS_OPERATOR_TOKENS
 
 
 class ToolRunner:
@@ -174,6 +179,64 @@ class ToolRunner:
         # cleanly and consistently.  This prevents the double-sudo problem
         # where the AI emits "sudo -n nmap ..." and _apply_sudo adds another.
         cmd = self._strip_sudo_prefix(cmd)
+
+        # Strip trailing interactive slash commands accidentally appended by LLMs
+        slash_commands = {"/cve", "/osint", "/topology", "/compliance", "/diff", "/remediate", "/proxy"}
+        parts = cmd.split()
+        if len(parts) > 1 and parts[-1].lower() in slash_commands:
+            parts = parts[:-1]
+            cmd = " ".join(parts).strip()
+
+        # Fix dirb invalid flag order or hallucinated flags:
+        # e.g. "dirb -a http://..." -> "dirb http://..."
+        if len(parts) >= 3 and parts[0].lower() == "dirb" and parts[1].lower() == "-a" and (parts[2].lower().startswith("http://") or parts[2].lower().startswith("https://")):
+            parts.pop(1)
+            cmd = " ".join(parts)
+
+        # Fix amass invalid syntax and URL targets:
+        # e.g. "amass -a http://111.90.156.228" -> "amass intel -addr 111.90.156.228"
+        # e.g. "amass intel -addr http://111.90.156.228" -> "amass intel -addr 111.90.156.228"
+        if len(parts) >= 2 and parts[0].lower() == "amass":
+            valid_subs = {"assoc", "db", "enum", "intel", "track", "viz"}
+            has_sub = any(p.lower() in valid_subs for p in parts)
+            
+            # Find the target (URL, domain, or IP)
+            target = None
+            target_idx = -1
+            for i, part in enumerate(parts):
+                if part.startswith("http://") or part.startswith("https://") or "." in part:
+                    if not part.startswith("-"):
+                        target = part
+                        target_idx = i
+                        break
+            
+            if target:
+                clean_target = target
+                if clean_target.startswith("http://"):
+                    clean_target = clean_target[7:]
+                elif clean_target.startswith("https://"):
+                    clean_target = clean_target[8:]
+                clean_target = clean_target.split('/')[0].split(':')[0]
+                
+                # Check if clean_target is an IP address
+                is_ip = False
+                dot_parts = clean_target.split('.')
+                if len(dot_parts) == 4:
+                    try:
+                        is_ip = all(0 <= int(p) <= 255 for p in dot_parts)
+                    except ValueError:
+                        pass
+                
+                # Case A: Missing subcommand or has invalid "-a" flag
+                if not has_sub or "-a" in [p.lower() for p in parts]:
+                    if is_ip:
+                        cmd = f"amass intel -addr {clean_target}"
+                    else:
+                        cmd = f"amass enum -d {clean_target}"
+                # Case B: Correct subcommand but has URL instead of domain/IP
+                elif target != clean_target:
+                    parts[target_idx] = clean_target
+                    cmd = " ".join(parts)
 
         return cmd
 
@@ -336,34 +399,43 @@ class ToolRunner:
         return shlex.split(command)
 
     @staticmethod
-    def _contains_shell_operators(command: str) -> Optional[str]:
-        """Return the offending marker if *command* contains shell command
-        substitution or a standalone shell-operator token, else None.
+    def _contains_shell_operators(command: str) -> tuple[Optional[str], bool]:
+        """Return ``(offending_token, is_pipe_only)``.
+
+        * ``(None, False)`` — no shell operators found; command is safe.
+        * ``(token, False)`` — a dangerous operator was found; reject.
+        * ``("|", True)`` — only pipe(s) found; caller may allow controlled
+          pipeline execution after validating each stage.
+        * ``("<unparseable>", False)`` — tokenization failed (e.g.
+          unbalanced quotes); reject.
 
         Operates on the NORMALIZED command (wrapping backticks and a leading
         ``$ `` prompt have already been stripped by ``_normalize_command``), so
         only *embedded* substitution survives to be rejected here.  Detection is
         token-based to avoid false positives on legitimate arguments such as URL
         query strings (``http://x/?a=1&b=2`` stays inside a single shlex token).
-
-        Returns ``"<unparseable>"`` when the command cannot be tokenized
-        (e.g. unbalanced quotes) so the caller can reject it gracefully.
         """
         # Command substitution: any remaining backtick or "$(" is rejected.
         if "`" in command:
-            return "`"
+            return "`", False
         if "$(" in command:
-            return "$("
+            return "$(", False
 
         try:
             tokens = ToolRunner._split_command(command)
         except ValueError:
-            return "<unparseable>"
+            return "<unparseable>", False
 
+        has_pipe = False
         for tok in tokens:
-            if tok in SHELL_OPERATOR_TOKENS:
-                return tok
-        return None
+            if tok in DANGEROUS_OPERATOR_TOKENS:
+                return tok, False
+            if tok in PIPE_TOKENS:
+                has_pipe = True
+
+        if has_pipe:
+            return "|", True
+        return None, False
 
     def validate_command(
         self, command: str, allow_install_drivers: bool = False,
@@ -388,12 +460,22 @@ class ToolRunner:
         # Unconditional (not safe_mode-gated): execution is shell-free, so this
         # is a clear, early hard-reject of unsupported syntax rather than a
         # confirmable RISKY warning.
-        offender = self._contains_shell_operators(command)
+        #
+        # Pipes are allowed: each stage is validated independently, and the
+        # pipeline is executed as chained subprocesses (no shell).
+        offender, is_pipe_only = self._contains_shell_operators(command)
         if offender == "<unparseable>":
             return False, "Invalid command: unbalanced quotes"
-        if offender is not None:
+        if offender is not None and not is_pipe_only:
             return False, f"Shell metacharacter not allowed: '{offender}'"
 
+        # ── Pipeline commands: validate every stage ──────────────────
+        if is_pipe_only:
+            return self._validate_pipeline(
+                command, allow_install_drivers=allow_install_drivers,
+            )
+
+        # ── Single command ───────────────────────────────────────────
         # Extract tool name (skip 'sudo' prefix for validation)
         try:
             parts = self._split_command(command)
@@ -407,12 +489,122 @@ class ToolRunner:
             return False, "Empty command"
 
         # Check if tool is allowed
-        if not self.is_tool_allowed(tool):
-            driver_ok = allow_install_drivers and os.path.basename(tool).lower() in INSTALL_DRIVERS
-            if not driver_ok:
-                return False, f"Tool '{tool}' is not in the allowed list"
+        if not self._is_tool_or_script_allowed(tool, command, allow_install_drivers):
+            return False, f"Tool '{tool}' is not in the allowed list"
 
         # Check risky patterns in safe mode
+        if self.safe_mode:
+            for pattern in RISKY_PATTERNS:
+                if pattern in cmd_lower:
+                    return True, f"RISKY: Contains '{pattern}' — requires confirmation"
+
+        return True, "OK"
+
+    def _is_tool_or_script_allowed(
+        self, tool: str, command: str = "", allow_install_drivers: bool = False,
+    ) -> bool:
+        """Check if *tool* is allowed, including HackBot-generated scripts."""
+        if self.is_tool_allowed(tool):
+            return True
+
+        # Allow install drivers when the flag is set (used by ToolInstaller)
+        if allow_install_drivers and os.path.basename(tool).lower() in INSTALL_DRIVERS:
+            return True
+
+        # Allow HackBot-generated scripts in the reports/scripts directory.
+        # The agent saves remediation / exploit scripts there and then tries
+        # to execute them — they must be permitted.
+        if command:
+            try:
+                parts = self._split_command(command)
+            except ValueError:
+                return False
+            for part in parts:
+                # Check if any argument is a path inside the scripts dir
+                if self._is_hackbot_script(part):
+                    return True
+
+        return False
+
+    @staticmethod
+    def _is_hackbot_script(path_str: str) -> bool:
+        """Return True if *path_str* looks like a HackBot-generated script."""
+        try:
+            p = Path(path_str)
+            if not p.is_absolute():
+                return False
+            # Match both the default REPORTS_DIR and common user overrides
+            parts_lower = [part.lower() for part in p.parts]
+            if "scripts" in parts_lower and (
+                "hackbot" in parts_lower
+                or "reports" in parts_lower
+                or ".local" in parts_lower
+            ):
+                return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    # ── Pipeline support ─────────────────────────────────────────────
+
+    @staticmethod
+    def _split_pipeline(command: str) -> List[str]:
+        """Split *command* at top-level pipe (``|``) tokens into stages.
+
+        Each returned string is a single command (whitespace-trimmed).
+        Raises ``ValueError`` if tokenization fails.
+        """
+        tokens = ToolRunner._split_command(command)
+        stages: List[List[str]] = [[]]
+        for tok in tokens:
+            if tok == "|":
+                stages.append([])
+            else:
+                stages[-1].append(tok)
+        # Re-join tokens with proper quoting
+        return [
+            shlex.join(stage) if platform.system() != "Windows"
+            else " ".join(stage)
+            for stage in stages
+            if stage  # drop empty stages from trailing pipes
+        ]
+
+    def _validate_pipeline(
+        self, command: str, allow_install_drivers: bool = False,
+    ) -> tuple[bool, str]:
+        """Validate every stage of a piped command independently."""
+        try:
+            stages = self._split_pipeline(command)
+        except ValueError:
+            return False, "Invalid pipeline: unbalanced quotes"
+
+        if len(stages) < 2:
+            return False, "Invalid pipeline: expected at least two stages"
+
+        for i, stage in enumerate(stages, 1):
+            stage_lower = stage.lower().strip()
+
+            # Check blocked commands in each stage
+            for blocked in BLOCKED_COMMANDS:
+                if blocked in stage_lower:
+                    return False, f"Blocked command detected in pipeline stage {i}: {blocked}"
+
+            try:
+                parts = self._split_command(stage)
+            except ValueError:
+                return False, f"Invalid pipeline stage {i}: unbalanced quotes"
+            if not parts:
+                return False, f"Empty pipeline stage {i}"
+
+            tool = self._extract_validated_tool(parts)
+            if not tool:
+                return False, f"Empty command in pipeline stage {i}"
+
+            if not self._is_tool_or_script_allowed(tool, stage, allow_install_drivers):
+                return False, f"Tool '{tool}' in pipeline stage {i} is not in the allowed list"
+
+        # Check risky patterns across the full command
+        cmd_lower = command.lower().strip()
         if self.safe_mode:
             for pattern in RISKY_PATTERNS:
                 if pattern in cmd_lower:
@@ -495,12 +687,146 @@ class ToolRunner:
         except Exception as e:
             return False, f"sudo check error: {e}"
 
+    def _is_pipeline(self, command: str) -> bool:
+        """Return True if *command* is a multi-stage pipeline."""
+        try:
+            tokens = self._split_command(command)
+        except ValueError:
+            return False
+        return "|" in tokens
+
+    def _execute_pipeline(
+        self, command: str, tool_name: str = "", explanation: str = "",
+    ) -> ToolResult:
+        """Execute a piped command as chained subprocesses (no shell)."""
+        start = time.time()
+        try:
+            stages = self._split_pipeline(command)
+        except ValueError as e:
+            return ToolResult(
+                tool=self._infer_tool_name(command, tool_name),
+                command=command,
+                stdout="",
+                stderr=f"Pipeline parse error: {e}",
+                return_code=-4,
+                duration=time.time() - start,
+                success=False,
+            )
+
+        is_windows = platform.system() == "Windows"
+        procs: list = []
+        try:
+            for i, stage in enumerate(stages):
+                args = stage if is_windows else shlex.split(stage)
+                stdin_src = procs[-1].stdout if procs else None
+                # Only the first stage may receive sudo password via stdin
+                stdin_data_for_stage = None
+                if i == 0 and "sudo -S" in stage:
+                    stdin_src = subprocess.PIPE
+                    stdin_data_for_stage = self._feed_sudo_password()
+
+                proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=stdin_src if stdin_src else (
+                        subprocess.PIPE if stdin_data_for_stage else None
+                    ),
+                    shell=False,
+                    text=True,
+                    env=self._get_env(),
+                )
+                # Feed sudo password to the first stage if needed
+                if stdin_data_for_stage and i == 0:
+                    proc.stdin.write(stdin_data_for_stage)
+                    proc.stdin.close()
+
+                # Close the previous proc's stdout so it can receive SIGPIPE
+                if procs and procs[-1].stdout:
+                    procs[-1].stdout.close()
+
+                procs.append(proc)
+
+            # Read output from last process
+            last_proc = procs[-1]
+            try:
+                stdout, stderr = last_proc.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                for p in procs:
+                    self._kill_process(p)
+                stdout, stderr = "", f"[TIMEOUT after {self.timeout}s]"
+
+            # Wait for all procs
+            for p in procs[:-1]:
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._kill_process(p)
+
+            # Collect stderr from all stages
+            all_stderr = []
+            for i, p in enumerate(procs[:-1]):
+                try:
+                    _, stage_err = p.communicate(timeout=2)
+                    if stage_err and stage_err.strip():
+                        all_stderr.append(f"[stage {i+1}] {stage_err.strip()}")
+                except Exception:
+                    pass
+            if stderr and stderr.strip():
+                all_stderr.append(stderr.strip())
+            combined_stderr = "\n".join(all_stderr)
+
+            duration = time.time() - start
+            stdout, truncated = self._truncate_output(stdout)
+
+            result = ToolResult(
+                tool=self._infer_tool_name(command, tool_name),
+                command=command,
+                stdout=stdout,
+                stderr=combined_stderr,
+                return_code=last_proc.returncode,
+                duration=duration,
+                success=last_proc.returncode == 0,
+                truncated=truncated,
+            )
+
+        except FileNotFoundError:
+            duration = time.time() - start
+            result = ToolResult(
+                tool=self._infer_tool_name(command, tool_name),
+                command=command,
+                stdout="",
+                stderr=f"Tool not found in pipeline: {self._infer_tool_name(command, tool_name)}",
+                return_code=-3,
+                duration=duration,
+                success=False,
+            )
+        except Exception as e:
+            duration = time.time() - start
+            result = ToolResult(
+                tool=self._infer_tool_name(command, tool_name),
+                command=command,
+                stdout="",
+                stderr=f"Pipeline execution error: {str(e)}",
+                return_code=-4,
+                duration=duration,
+                success=False,
+            )
+
+        self.history.append(result)
+        self._log_execution(result)
+        if self.on_output:
+            self.on_output(result.output)
+        return result
+
     def execute(
         self, command: str, tool_name: str = "", explanation: str = "",
         allow_install_drivers: bool = False,
     ) -> ToolResult:
         """
         Execute a command synchronously with timeout and output capture.
+        Supports piped commands (e.g. ``nmap ... | grep open``) by chaining
+        subprocesses without invoking a shell.
         """
         command = self._normalize_command(command)
 
@@ -542,7 +868,11 @@ class ToolRunner:
                         success=False,
                     )
 
-        # Execute
+        # ── Pipeline execution (piped commands) ──────────────────────
+        if self._is_pipeline(command):
+            return self._execute_pipeline(command, tool_name=tool_name, explanation=explanation)
+
+        # ── Single command execution ─────────────────────────────────
         start = time.time()
         stdin_data = self._feed_sudo_password() if "sudo -S" in command else None
 
@@ -654,6 +984,13 @@ class ToolRunner:
                         success=False,
                     )
 
+        # Pipeline execution — delegate to sync pipeline executor in a thread
+        if self._is_pipeline(command):
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, self._execute_pipeline, command, tool_name,
+            )
+
         start = time.time()
         stdin_data = self._feed_sudo_password() if "sudo -S" in command else None
 
@@ -761,10 +1098,20 @@ class ToolRunner:
             if platform.system() == "Windows":
                 proc.kill()
             else:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                time.sleep(1)
-                if proc.poll() is None:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                pid = proc.pid
+                pgid = os.getpgid(pid)
+                if pgid == os.getpgrp():
+                    # Same process group! Do NOT killpg, otherwise we kill ourselves.
+                    # Just kill the process itself.
+                    proc.terminate()
+                    time.sleep(1)
+                    if proc.poll() is None:
+                        proc.kill()
+                else:
+                    os.killpg(pgid, signal.SIGTERM)
+                    time.sleep(1)
+                    if proc.poll() is None:
+                        os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()
