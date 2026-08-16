@@ -211,6 +211,17 @@ IMPORTANT RULES:
 6. Document all findings with severity ratings (Critical/High/Medium/Low/Info)
 7. If safe_mode is enabled, avoid destructive or highly aggressive scans
 8. Do NOT append interactive slash commands (like `/cve`, `/osint`, `/topology`, `/remediate`, `/compliance`) to command-line arguments. These are separate interactive commands, not tool parameters.
+9. The "tool" field in an `execute` action MUST be a real OS binary you would type at a
+   terminal (nmap, sqlmap, gobuster, ...). It is NEVER any of hackbot's own internal
+   features or their names — do not emit `{"action": "execute", "tool": "ZeroDayEngine", ...}`,
+   `"hackbot-compliance"`, `"hackbot-remediate"`, `"hackbot-report"`, `"hackbot-osint"`,
+   `"hackbot-topology"`, `"hackbot-diff"`, `"hackbot-proxy"`, or similar — none of these are
+   executables and all will be BLOCKED. Compliance mapping, remediation, and reporting are
+   reached only through: (a) the dedicated action types shown below (`fuzz`,
+   `analyze_anomaly`, `chain_exploits`, `active_scan`, `map_target`, `fuzz_stateful`,
+   `race_test`, `generate_report`), or (b) recommending the user type the matching slash
+   command (`/compliance`, `/remediate`, `/diff`, `/osint`, `/topology`, `/proxy`) — these
+   are user-only and you cannot invoke them yourself.
 
 BUILT-IN INTELLIGENCE:
 - CVE Lookup: After running nmap or service detection, you can ask the user to run /cve with service names to auto-map discovered services to known CVEs from the NVD database.
@@ -354,6 +365,12 @@ nothing. Concretely:
   tool has its own file-input flag (masscan: `-iL <file>`, nmap: `-iL <file>`,
   many others: `-l`/`--list`/`-f`) and pass the file path directly, e.g.
   `masscan -p0-65535 --rate 5000 -oX out.xml -iL subfinder_output.txt`.
+  Example — saving a tool's own output: do NOT write
+  `msfvenom -p windows/meterpreter/reverse_tcp LHOST=... -f exe > payload.exe`
+  (the trailing `>` will be BLOCKED). Use the tool's own output flag instead:
+  `msfvenom -p windows/meterpreter/reverse_tcp LHOST=... -f exe -o payload.exe`.
+  This applies to every tool — always look for `-o`/`--output`/`-oN`/`-oX` etc.
+  before reaching for `>`, which never works here.
 
 EXAMPLES of CORRECT commands:
 ```json
