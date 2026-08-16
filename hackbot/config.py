@@ -605,15 +605,46 @@ TOOL_INSTALL_MAP: Dict[str, Dict[str, object]] = {
 }
 
 
+def extra_tool_dirs() -> List[str]:
+    """Common installer output dirs that GUI/launcher sessions often omit
+    from PATH (they're only added by shell rc files, which non-interactive
+    or graphical launches don't source).
+    """
+    home = Path.home()
+    candidates = [
+        home / "go" / "bin",            # go install
+        home / ".local" / "bin",        # pip --user / pipx
+        Path("/opt/homebrew/bin"),      # Homebrew on Apple Silicon
+        Path("/usr/local/bin"),
+        Path("/usr/local/sbin"),
+    ]
+    return [str(p) for p in candidates if p.is_dir()]
+
+
+def augmented_path_env() -> str:
+    """Current PATH with extra_tool_dirs() appended (de-duplicated)."""
+    current = os.environ.get("PATH", "")
+    parts = current.split(os.pathsep) if current else []
+    seen = set(parts)
+    for extra in extra_tool_dirs():
+        if extra not in seen:
+            parts.append(extra)
+            seen.add(extra)
+    return os.pathsep.join(parts)
+
+
 def resolve_tool_path(tool: str) -> Optional[str]:
     """Resolve a logical tool name to an installed executable path.
 
     Returns the first executable path found for the given tool (including
-    aliases), otherwise None.
+    aliases), otherwise None. Falls back to common installer directories
+    (``~/go/bin``, ``~/.local/bin``, ...) that graphical/launcher sessions
+    frequently omit from PATH.
     """
     candidates = TOOL_ALIASES.get(tool.lower(), [tool])
+    search_path = augmented_path_env()
     for candidate in candidates:
-        path = shutil.which(candidate)
+        path = shutil.which(candidate, path=search_path)
         if path:
             return path
     return None

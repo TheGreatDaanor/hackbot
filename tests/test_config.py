@@ -95,12 +95,12 @@ def test_resolve_tool_path_thc_ipv6_alias(monkeypatch):
     """thc-ipv6 should resolve via Kali-style alias binaries (e.g., alive6)."""
     real_which = __import__("shutil").which
 
-    def fake_which(name):
+    def fake_which(name, path=None):
         if name == "alive6":
             return "/usr/bin/alive6"
         if name == "thc-ipv6":
             return None
-        return real_which(name)
+        return real_which(name, path=path)
 
     monkeypatch.setattr("hackbot.config.shutil.which", fake_which)
     assert resolve_tool_path("thc-ipv6") == "/usr/bin/alive6"
@@ -110,12 +110,12 @@ def test_detect_tools_thc_ipv6_alias(monkeypatch):
     """detect_tools should mark thc-ipv6 installed when an alias binary exists."""
     real_which = __import__("shutil").which
 
-    def fake_which(name):
+    def fake_which(name, path=None):
         if name == "alive6":
             return "/usr/bin/alive6"
         if name == "thc-ipv6":
             return None
-        return real_which(name)
+        return real_which(name, path=path)
 
     monkeypatch.setattr("hackbot.config.shutil.which", fake_which)
     tools = detect_tools(["thc-ipv6"])

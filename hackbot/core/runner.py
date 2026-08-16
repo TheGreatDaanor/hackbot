@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from hackbot.config import INSTALL_DRIVERS, LOGS_DIR, resolve_tool_path
+from hackbot.config import INSTALL_DRIVERS, LOGS_DIR, augmented_path_env, resolve_tool_path
 
 # Lazy reference — filled at runtime to avoid circular imports
 _plugin_manager = None
@@ -1090,6 +1090,11 @@ class ToolRunner:
         # Remove sensitive vars from subprocess env
         for key in ["HACKBOT_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
             env.pop(key, None)
+        # Graphical/launcher sessions (e.g. the .desktop entry) often don't
+        # inherit shell rc PATH additions, so tools installed via `go
+        # install` (~/go/bin) or pip/pipx (~/.local/bin) go missing even
+        # though they're on disk. Augment PATH to match resolve_tool_path().
+        env["PATH"] = augmented_path_env()
         return env
 
     def _kill_process(self, proc: subprocess.Popen) -> None:
