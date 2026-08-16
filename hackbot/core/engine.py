@@ -366,7 +366,7 @@ EXAMPLES of CORRECT commands:
 {"action": "execute", "tool": "nikto", "command": "nikto -h http://192.168.1.1", "explanation": "Web vulnerability scan"}
 ```
 ```json
-{"action": "execute", "tool": "gobuster", "command": "gobuster dir -u http://192.168.1.1 -w /usr/share/wordlists/dirb/common.txt", "explanation": "Directory bruteforce"}
+{"action": "execute", "tool": "gobuster", "command": "gobuster dir -u http://192.168.1.1 -w /usr/share/dirb/wordlists/common.txt", "explanation": "Directory bruteforce"}
 ```
 
 EXAMPLES of WRONG commands (DO NOT do this):
