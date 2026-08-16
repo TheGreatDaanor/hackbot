@@ -337,6 +337,11 @@ nothing. Concretely:
   turn — using a real output file path (most tools support `-o`/`-oX`/`--output`, etc.)
   instead of a named pipe (`mkfifo`), process substitution, or backgrounding. Do not
   try to orchestrate this with shell control flow; you don't have a shell.
+  Example — feeding a target list from one tool into another: do NOT write
+  `masscan ... <(cat subfinder_output.txt)`. Instead check whether the target
+  tool has its own file-input flag (masscan: `-iL <file>`, nmap: `-iL <file>`,
+  many others: `-l`/`--list`/`-f`) and pass the file path directly, e.g.
+  `masscan -p0-65535 --rate 5000 -oX out.xml -iL subfinder_output.txt`.
 
 EXAMPLES of CORRECT commands:
 ```json

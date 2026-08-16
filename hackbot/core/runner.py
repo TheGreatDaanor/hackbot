@@ -432,6 +432,19 @@ class ToolRunner:
                 return tok, False
             if tok in PIPE_TOKENS:
                 has_pipe = True
+                continue
+            # Process substitution ("<(cmd)" / ">(cmd)") glues the operator
+            # directly onto the following text with no whitespace, so it
+            # survives as part of a larger token (e.g. "<(cat") and slips
+            # past the exact-match check above. Reject it explicitly rather
+            # than blanket-rejecting any "<"/">" in a token, which would
+            # also break legitimate literal payload args (e.g. XSS strings
+            # like "<script>alert(1)</script>" passed as --data — safe here
+            # since there's no shell to interpret them).
+            if "<(" in tok:
+                return "<(", False
+            if ">(" in tok:
+                return ">(", False
 
         if has_pipe:
             return "|", True
