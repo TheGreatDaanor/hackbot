@@ -581,11 +581,16 @@ TOOL_INSTALL_MAP: Dict[str, Dict[str, object]] = {
     "whatweb": {"order": ["apt"], "apt": "whatweb"},
     "wpscan": {"order": ["apt"], "apt": "wpscan"},
     "hydra": {"order": ["apt"], "apt": "hydra"},
-    # dnsrecon's only PyPI release (0.10.1) calls the long-removed
-    # urllib.request.FancyURLopener and crashes on any Python >= 3.12 —
-    # pipx/pip installs "succeed" (binary exists) but the tool can't run.
-    # apt-only until upstream ships a fixed release.
-    "dnsrecon": {"order": ["apt"], "apt": "dnsrecon"},
+    # dnsrecon calls the long-removed urllib.request.FancyURLopener at
+    # *import time*, so it crashes on any Python >= 3.12 no matter how it's
+    # installed — confirmed on both the PyPI release (0.10.1) AND the
+    # Debian/Kali apt package (1.3.1-3, which just symlinks to the same
+    # broken upstream script and runs it against system python3). There is
+    # currently no package-manager path that produces a working binary, so
+    # it's intentionally left out of TOOL_INSTALL_MAP. If a user's system
+    # happens to have Python < 3.12 an existing install may still work
+    # (resolve_tool_path will find it), but hackbot can't fix a broken one
+    # or install a working one — prefer dnsenum/amass/subfinder instead.
     "amass": {
         "order": ["apt", "go"],
         "apt": "amass",

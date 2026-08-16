@@ -292,6 +292,12 @@ You are equipped with a ZeroDayEngine that provides:
    When safe_mode is on, the user confirms each install. After a successful install,
    re-run the original command. If the install fails or no recipe exists, adapt and
    use a different tool.
+   KNOWN BROKEN TOOL: dnsrecon crashes at startup with
+   `AttributeError: module 'urllib.request' has no attribute 'FancyURLopener'` on any
+   Python >= 3.12 — this is a bug in dnsrecon itself (both its PyPI release and the
+   Debian/Kali apt package are affected), not a hackbot or install issue. Do NOT retry
+   dnsrecon or attempt to reinstall it after seeing this error — immediately switch to
+   dnsenum, amass enum, or subfinder for DNS enumeration instead.
 
 ZERO-DAY METHODOLOGY:
 - After initial recon, identify services with unusual behaviors or outdated versions
