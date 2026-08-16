@@ -581,7 +581,11 @@ TOOL_INSTALL_MAP: Dict[str, Dict[str, object]] = {
     "whatweb": {"order": ["apt"], "apt": "whatweb"},
     "wpscan": {"order": ["apt"], "apt": "wpscan"},
     "hydra": {"order": ["apt"], "apt": "hydra"},
-    "dnsrecon": {"order": ["apt", "pipx"], "apt": "dnsrecon", "pipx": "dnsrecon"},
+    # dnsrecon's only PyPI release (0.10.1) calls the long-removed
+    # urllib.request.FancyURLopener and crashes on any Python >= 3.12 —
+    # pipx/pip installs "succeed" (binary exists) but the tool can't run.
+    # apt-only until upstream ships a fixed release.
+    "dnsrecon": {"order": ["apt"], "apt": "dnsrecon"},
     "amass": {
         "order": ["apt", "go"],
         "apt": "amass",
