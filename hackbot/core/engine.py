@@ -319,6 +319,25 @@ CRITICAL COMMAND RULES:
 - Do NOT include "sudo" in the command — sudo is handled automatically by the system.
 - The "tool" field should match the binary name (e.g., "nmap", "nikto", "sqlmap").
 
+EXECUTION MODEL — READ CAREFULLY, THIS IS NOT A SHELL:
+Each "command" is executed directly (execve), NOT through bash/sh. There is no shell
+interpreting your string, so shell syntax is either rejected outright or simply does
+nothing. Concretely:
+- FORBIDDEN, will be BLOCKED before running: `;` `&` `&&` `||` backticks `` ` `` `$(...)`
+  `<(...)` `>(...)` `>` `>>` `<` and any other shell metacharacter or redirection.
+- NOT SUPPORTED: subshells, backgrounding a process with trailing `&`, command
+  substitution, environment-variable expansion (`$VAR`), globbing (`*`), here-docs,
+  or multi-statement one-liners of any kind.
+- SUPPORTED: a single command with arguments, OR a simple pipeline of the form
+  `cmd1 | cmd2 | cmd3` — each stage is spawned directly and connected via a real pipe
+  (no shell involved), so redirection/metacharacters inside a pipeline stage are still
+  blocked the same way.
+- If a task needs multiple steps (e.g. "run tool A, save its output, then feed that
+  output into tool B"), issue them as SEPARATE, SEQUENTIAL action blocks — one per
+  turn — using a real output file path (most tools support `-o`/`-oX`/`--output`, etc.)
+  instead of a named pipe (`mkfifo`), process substitution, or backgrounding. Do not
+  try to orchestrate this with shell control flow; you don't have a shell.
+
 EXAMPLES of CORRECT commands:
 ```json
 {"action": "execute", "tool": "nmap", "command": "nmap -sV -sC -T4 192.168.1.1", "explanation": "Full port scan with version detection and scripts"}
