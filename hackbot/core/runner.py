@@ -238,6 +238,29 @@ class ToolRunner:
                     parts[target_idx] = clean_target
                     cmd = " ".join(parts)
 
+        # Fix nmap/masscan given a bare file path as a positional target
+        # instead of the flag that actually reads targets from a file:
+        # e.g. "nmap -sV subdomains.txt" -> "nmap -sV -iL subdomains.txt"
+        # Only fires when the filename is a genuine trailing positional, not
+        # already the value of a preceding flag that consumes a file path
+        # (e.g. "-oN results.txt"), so real output-file arguments are left
+        # untouched. Flags like "-sV" immediately before it don't consume an
+        # argument, so their presence doesn't disqualify the fix.
+        _FILE_ARG_FLAGS = {
+            "-il", "-on", "-ox", "-og", "-os", "-oa",
+            "--exclude-file", "--resume", "--stylesheet",
+        }
+        if (
+            parts
+            and parts[0].lower() in {"nmap", "masscan"}
+            and "-iL" not in parts
+            and len(parts) >= 2
+            and parts[-2].lower() not in _FILE_ARG_FLAGS
+            and parts[-1].lower().endswith((".txt", ".lst", ".list"))
+        ):
+            parts.insert(len(parts) - 1, "-iL")
+            cmd = " ".join(parts)
+
         return cmd
 
     @staticmethod

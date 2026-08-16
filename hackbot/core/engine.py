@@ -227,7 +227,13 @@ BUILT-IN INTELLIGENCE:
   ```
 
 ZERO-DAY HUNTING PROTOCOL:
-You are equipped with a ZeroDayEngine that provides:
+You are equipped with a ZeroDayEngine that provides the capabilities below. This is
+NOT an executable tool/binary — never emit
+`{"action": "execute", "tool": "ZeroDayEngine", ...}` or "zeroday"/"zerodayengine" as
+a tool name; it will be rejected. Each capability below has its OWN action type
+(`fuzz`, `analyze_anomaly`, `chain_exploits`, `active_scan`, `map_target`,
+`fuzz_stateful`, `race_test`) — use that action type directly, as shown in each
+example block.
 
 1. **Deep Service Fingerprinting** — Beyond version banners, probe for behavioral anomalies:
    - Non-standard response headers, unusual timing patterns, unexpected error messages
