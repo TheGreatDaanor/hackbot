@@ -621,11 +621,13 @@ TOOL_INSTALL_MAP: Dict[str, Dict[str, object]] = {
     "bettercap": {"order": ["apt"], "apt": "bettercap"},
     "ettercap": {"order": ["apt"], "apt": "ettercap-graphical"},
     "responder": {"order": ["apt"], "apt": "responder"},
-    "nxc": {"order": ["apt", "pipx"], "apt": "netexec", "pipx": "netexec"},
-    "crackmapexec": {"order": ["apt", "pipx"], "apt": "crackmapexec", "pipx": "crackmapexec"},
+    "nxc": {"order": ["apt"], "apt": "netexec"},
+    # netexec/crackmapexec have no PyPI distribution (apt or git-clone only).
+    "crackmapexec": {"order": ["apt"], "apt": "crackmapexec"},
     "smbclient": {"order": ["apt"], "apt": "smbclient"},
     "enum4linux": {"order": ["apt"], "apt": "enum4linux"},
-    "enum4linux-ng": {"order": ["apt", "pipx"], "apt": "enum4linux-ng", "pipx": "enum4linux-ng"},
+    # enum4linux-ng has no PyPI distribution (apt or git-clone only).
+    "enum4linux-ng": {"order": ["apt"], "apt": "enum4linux-ng"},
     "ldapsearch": {"order": ["apt"], "apt": "ldap-utils"},
     "nbtscan": {"order": ["apt"], "apt": "nbtscan"},
     "onesixtyone": {"order": ["apt"], "apt": "onesixtyone"},
@@ -645,11 +647,14 @@ TOOL_INSTALL_MAP: Dict[str, Dict[str, object]] = {
     "gau": {"order": ["go"], "go": "github.com/lc/gau/v2/cmd/gau@latest"},
     "waybackurls": {"order": ["go"], "go": "github.com/tomnomnom/waybackurls@latest"},
     "crlfuzz": {"order": ["go"], "go": "github.com/dwisiswant0/crlfuzz/cmd/crlfuzz@latest"},
-    "ghauri": {"order": ["pipx", "pip"], "pipx": "ghauri", "pip": "ghauri"},
-    "arjun": {"order": ["pipx", "pip"], "pipx": "arjun", "pip": "arjun"},
-    "paramspider": {"order": ["pipx", "pip"], "pipx": "paramspider", "pip": "paramspider"},
-    # tplmap, jwt_tool, xxeinjector, ysoserial: no maintained package-manager
-    # distribution (git-clone-only upstreams) — left unmapped, install manually.
+    "arjun": {"order": ["apt", "pipx", "pip"], "apt": "arjun", "pipx": "arjun", "pip": "arjun"},
+    # paramspider's PyPI package (0.0.1) is an unrelated placeholder with no
+    # CLI entry point — the real tool (devanshbatham/ParamSpider) is
+    # git-clone only, so it's left unmapped alongside the tools below.
+    #
+    # ghauri, tplmap, jwt_tool, xxeinjector, ysoserial: no maintained
+    # package-manager distribution (git-clone-only upstreams) — left
+    # unmapped, install manually.
 }
 
 
